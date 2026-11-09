@@ -8,7 +8,7 @@ section .text
 ; Tile address currently drawn in each of the 800 screen cells (+66 words of sprite overrun
 ; padding), kept in nes_ram_seg's otherwise unused 6502 RAM-mirror area ($1000..$16C3)
 ; because the CS segment is nearly full for large ROMs.
-SCREEN_TILE equ 1000h
+SCREEN_TILE equ 1000h          ; (in bg_seg, like CGA_TILE_OFFSETS)
 CGA_TILE_OFFSETS equ 0800h  ; 800 words: CGA even-bank offset of each screen cell
 
 ; ------------------------------------------------------------------------------
@@ -53,6 +53,15 @@ runtime_init:
 
 .alloc_ok:
     mov [cs:xlate_seg], ax
+
+    ; Background segment: same offsets as nes_ram_seg for CGA_TILE_OFFSETS, SCREEN_TILE
+    ; and the CGA tiles at 4000h, which here are recoloured through the background
+    ; palette mapping (sprites keep using the raw tiles in nes_ram_seg)
+    mov bx, 600h
+    mov ah, 48h
+    int 21h
+    jc .alloc_fail
+    mov [cs:bg_seg], ax
 
     ; Sprite save-under buffer (SAVE_MAX blocks of 18 bytes)
     mov bx, 100h
@@ -165,10 +174,31 @@ runtime_init:
     stosw
     loop .hflip_loop
 
+    ; Identity sprite translation tables until the game sets its palette
+    mov es, [cs:nes_ram_seg]
+    push cs
+    pop ds
+    mov si, spr_maps
+    mov di, XLAT_SPR
+    mov cx, 4
+.init_xlat:
+    call build_xlat         ; (advances DI by 256)
+    add si, 4
+    loop .init_xlat
+
+    ; Background tiles start as an identity copy (until the game sets its palette)
+    mov ds, [cs:nes_ram_seg]
+    mov es, [cs:bg_seg]
+    mov si, 4000h
+    mov di, si
+    mov cx, 4096
+    cld
+    rep movsw
+
     ; Precompute CGA tile offsets (800 tiles: 25 rows of 32 tiles)
     push cs
     pop ds
-    mov es, [cs:nes_ram_seg]
+    mov es, [cs:bg_seg]
     mov di, CGA_TILE_OFFSETS
     xor bx, bx              ; BX = tile index (0..799)
 .calc_offsets:
@@ -246,7 +276,7 @@ runtime_init:
     rep stosw
 
     ; Invalidate the on-screen tile shadow (nothing drawn yet)
-    mov es, [cs:nes_ram_seg]
+    mov es, [cs:bg_seg]
     mov di, SCREEN_TILE
     mov cx, 800 + 66
     mov ax, 0FFFFh
@@ -711,7 +741,7 @@ bench_isr_end:
     mov ax, [cs:invert_word]
     mov cx, 8192
     rep stosw
-    mov es, [cs:nes_ram_seg]
+    mov es, [cs:bg_seg]
     mov di, SCREEN_TILE
     mov cx, 800 + 66
     mov ax, 0FFFFh
@@ -1345,6 +1375,10 @@ spr_wrapped:
     mov bh, bl
     shl bh, 1
     or  bl, bh
+    push bx
+    mov bx, [cs:spr_xlat]
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    pop bx
     cmp byte [cs:invert_on], 0
     jne short .put_inv
     not bl
@@ -1526,6 +1560,239 @@ sprite_restore:
     pop ax
     ret
 
+; ------------------------------------------------------------------------------
+; PALETTE MAPPING: CGA mode 4 has 4 fixed colours, so NES colours are mapped by
+; brightness. Background palette 0 (4 colours, attributes are not emulated) is ranked
+; onto black / magenta / cyan / white; each sprite palette's 3 colours are ranked onto
+; black / cyan / white, leaving magenta to the background so mid-tone playfields
+; (Road Fighter's grey road) never swallow sprites. The maps become 256-entry byte
+; translation tables (4 pixels per byte) in nes_ram_seg; the background tile set in
+; bg_seg is regenerated only when its map changes.
+; ------------------------------------------------------------------------------
+XLAT_BG     equ 1800h           ; nes_ram_seg: background byte translation table
+XLAT_SPR    equ 1900h           ; nes_ram_seg: 4 sprite tables (1900h, 1A00h, 1B00h, 1C00h)
+
+; AL = NES colour -> AL = brightness 0 (black) .. 8 (white)
+nes_luma:
+    push bx
+    mov bl, al
+    and bl, 0Fh
+    cmp bl, 0Dh
+    jae short .black
+    mov bh, bl              ; BH = hue (0 = grey column)
+    shr al, 1
+    shr al, 1
+    shr al, 1
+    and al, 06h             ; AL = row * 2
+    inc al
+    test bh, bh
+    jnz short .done
+    inc al                  ; Greys are a little brighter than hues of the same row
+.done:
+    pop bx
+    ret
+.black:
+    xor al, al
+    pop bx
+    ret
+
+; Ranks CX colours at CS:SI (lumas at CS:luma_tmp) and writes levels from CS:BX
+; (indexed by rank) to CS:DI. Rank = number of entries strictly darker.
+rank_colours:
+    push ax
+    push cx
+    push dx
+    push si
+    push bp
+    mov dx, cx
+    xor bp, bp
+.outer:
+    xor ah, ah              ; AH = rank
+    mov al, [cs:luma_tmp + bp]
+    push bp
+    xor bp, bp
+.inner:
+    cmp [cs:luma_tmp + bp], al
+    jae short .not_darker
+    inc ah
+.not_darker:
+    inc bp
+    cmp bp, dx
+    jb .inner
+    pop bp
+    push bx
+    mov al, ah
+    xor ah, ah
+    add bx, ax
+    mov al, [cs:bx]
+    pop bx
+    mov [cs:di + bp], al
+    inc bp
+    cmp bp, dx
+    jb .outer
+    pop bp
+    pop si
+    pop dx
+    pop cx
+    pop ax
+    ret
+
+; Builds the 256-byte translation table at ES:DI from the 4-entry map at CS:SI
+build_xlat:
+    push ax
+    push bx
+    push cx
+    push dx
+    xor dl, dl
+.next:
+    xor ah, ah
+    mov al, dl
+    mov ch, 4
+.px:
+    rol al, 1
+    rol al, 1
+    mov bl, al
+    and bl, 3
+    xor bh, bh
+    mov bl, [cs:si + bx]
+    shl ah, 1
+    shl ah, 1
+    or ah, bl
+    dec ch
+    jnz .px
+    mov [es:di], ah
+    inc di
+    inc dl
+    jnz .next
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; Recomputes the colour maps when the NES palette changed (called from flush)
+palette_update:
+    cmp byte [cs:palette_dirty], 0
+    jne short .go
+    ret
+.go:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push ds
+    push es
+    push cs
+    pop ds
+    mov byte [palette_dirty], 0
+    mov es, [cs:nes_ram_seg]
+
+    ; Background palette 0: entries 0..3
+    xor si, si
+.bg_luma:
+    mov al, [palette_ram + si]
+    call nes_luma
+    mov [luma_tmp + si], al
+    inc si
+    cmp si, 4
+    jb .bg_luma
+    mov cx, 4
+    mov bx, levels_bg
+    mov di, new_map
+    call rank_colours
+    mov ax, [new_map]
+    mov dx, [new_map + 2]
+    cmp ax, [bg_map]
+    jne short .bg_changed
+    cmp dx, [bg_map + 2]
+    je short .bg_same
+.bg_changed:
+    mov [bg_map], ax
+    mov [bg_map + 2], dx
+    mov si, bg_map
+    mov di, XLAT_BG
+    call build_xlat
+    ; Recolour the background tile set and repaint everything
+    push ds
+    mov ds, [cs:nes_ram_seg]
+    mov es, [cs:bg_seg]
+    mov si, 4000h
+    mov di, 4000h
+    mov bx, XLAT_BG
+    mov cx, 8192
+    cld
+.recolour:
+    lodsb
+    xlat
+    stosb
+    loop .recolour
+    mov di, SCREEN_TILE
+    mov cx, 800 + 66
+    mov ax, 0FFFFh
+    rep stosw
+    pop ds
+    mov es, [cs:nes_ram_seg]
+    call mark_all_dirty
+.bg_same:
+
+    ; Sprite palettes: entries 16 + 4p + 1..3 (entry 0 is transparent)
+    xor dx, dx              ; DX = palette number
+.spr_pal:
+    mov bx, dx
+    shl bx, 1
+    shl bx, 1
+    add bx, palette_ram + 17
+    xor si, si
+.spr_luma:
+    mov al, [bx + si]
+    call nes_luma
+    mov [luma_tmp + si], al
+    inc si
+    cmp si, 3
+    jb .spr_luma
+    mov cx, 3
+    mov bx, levels_spr
+    mov di, new_map + 1
+    mov byte [new_map], 0
+    call rank_colours
+    mov bx, dx
+    shl bx, 1
+    shl bx, 1
+    add bx, spr_maps        ; BX = this palette's current map
+    mov ax, [new_map]
+    cmp ax, [bx]
+    jne short .spr_changed
+    mov ax, [new_map + 2]
+    cmp ax, [bx + 2]
+    je short .spr_same
+.spr_changed:
+    mov ax, [new_map]
+    mov [bx], ax
+    mov ax, [new_map + 2]
+    mov [bx + 2], ax
+    mov si, bx
+    mov di, dx
+    mov cl, 8
+    shl di, cl
+    add di, XLAT_SPR
+    call build_xlat
+.spr_same:
+    inc dx
+    cmp dx, 4
+    jb .spr_pal
+
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
 ; Applies a pending invert-colours toggle (from the I key) between renders: flips every
 ; pixel already on screen (colour c -> 3 - c), after which all drawing uses the inverted
 ; blitters, so the shadow of what is on screen stays valid.
@@ -1662,7 +1929,12 @@ hle_write_2007:
     ret
 .write_pal:
     and bx, 1Fh
+    test bl, 03h
+    jnz short .pal_store
+    and bl, 0Fh             ; Sprite entry 0 mirrors the background entry
+.pal_store:
     mov [cs:palette_ram + bx], al
+    mov byte [cs:palette_dirty], 1
     jmp short .advance_addr
 
 hle_read_2007:
@@ -2168,6 +2440,7 @@ apu_update_60hz:
 ; ------------------------------------------------------------------------------
 flush_dirty_tiles:
     call sprite_restore     ; Undo last frame's sprites before any tile update
+    call palette_update     ; Recolour tables if the NES palette changed
     cmp word [cs:dirty_count], 0
     jne short .do_flush
     ret
@@ -2464,7 +2737,7 @@ flush_dirty_tiles:
     mov dx, [flush_cell]
     shl dx, 1               ; DX = cga_tile_offsets index
     mov es, [cs:cga_seg]
-    mov ds, [cs:nes_ram_seg]
+    mov ds, [cs:bg_seg]
 .ds_loop:
     mov al, [cs:vram_nametable + bx]
     xor ah, ah
@@ -2609,8 +2882,8 @@ flush_dirty_tiles:
 ; caller. Preserves DS; clobbers AX, CX, SI, DI, ES.
 .shadow_shift:
     push ds
-    mov es, [cs:nes_ram_seg]
-    mov ds, [cs:nes_ram_seg]
+    mov es, [cs:bg_seg]
+    mov ds, [cs:bg_seg]
     test ax, ax
     js short .ss_right
     mov cx, 800
@@ -2704,7 +2977,7 @@ flush_dirty_tiles:
 ; Repaints screen cell AX unconditionally (DS = CS on entry and exit, BP = pattern base)
 .force_cell:
     push ds
-    mov ds, [cs:nes_ram_seg]
+    mov ds, [cs:bg_seg]
     mov di, ax
     shl di, 1
     mov word [SCREEN_TILE + di], 0FFFFh
@@ -2765,7 +3038,7 @@ flush_dirty_tiles:
     mov dx, [flush_cell]
     shl dx, 1               ; DX = cga_tile_offsets index
     mov es, [cs:cga_seg]
-    mov ds, [cs:nes_ram_seg]
+    mov ds, [cs:bg_seg]
 .ds_loop_inv:
     mov al, [cs:vram_nametable + bx]
     xor ah, ah
@@ -2867,7 +3140,7 @@ flush_dirty_tiles:
     add ax, bp
     add ax, 4000h
     mov si, ax
-    mov ds, [cs:nes_ram_seg]
+    mov ds, [cs:bg_seg]
     cmp si, [SCREEN_TILE + di]
     je short .bc_same       ; Cell already shows this tile
     mov [SCREEN_TILE + di], si
@@ -2970,6 +3243,14 @@ draw_sprites:
     ja .spr_next
 
 
+    ; Palette translation table for this sprite (attribute bits 0-1)
+    mov al, [oam_ram + bx + 2]
+    and al, 3
+    add al, XLAT_SPR >> 8
+    mov ah, al
+    xor al, al
+    mov [spr_xlat], ax
+
     ; Compute SI = pre-converted CGA tile address in nes_ram_seg:4000h (or 6000h if H-flipped)
     mov al, [oam_ram + bx + 1]
     test byte [ppu_ctrl], 20h
@@ -3067,6 +3348,8 @@ draw_sprites:
 .blit_spr_8x8_go:
     push cx
     push dx
+    push bx
+    mov bx, [cs:spr_xlat]
     mov ax, [si]
     or  ax, ax
     jz short .s_row1
@@ -3077,6 +3360,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di], dx
     or  [es:di], ax
@@ -3091,6 +3378,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 2000h], dx
     or  [es:di + 2000h], ax
@@ -3105,6 +3396,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 80], dx
     or  [es:di + 80], ax
@@ -3119,6 +3414,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 2000h + 80], dx
     or  [es:di + 2000h + 80], ax
@@ -3133,6 +3432,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 160], dx
     or  [es:di + 160], ax
@@ -3147,6 +3450,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 2000h + 160], dx
     or  [es:di + 2000h + 160], ax
@@ -3161,6 +3468,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 240], dx
     or  [es:di + 240], ax
@@ -3175,10 +3486,15 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 2000h + 240], dx
     or  [es:di + 2000h + 240], ax
 .s_row8:
+    pop bx
     pop dx
     pop cx
     pop di
@@ -3199,6 +3515,8 @@ draw_sprites:
 .blit_spr_8x8_vflip_go:
     push cx
     push dx
+    push bx
+    mov bx, [cs:spr_xlat]
     mov ax, [si + 14]
     or  ax, ax
     jz short .sv_row1
@@ -3209,6 +3527,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di], dx
     or  [es:di], ax
@@ -3223,6 +3545,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 2000h], dx
     or  [es:di + 2000h], ax
@@ -3237,6 +3563,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 80], dx
     or  [es:di + 80], ax
@@ -3251,6 +3581,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 2000h + 80], dx
     or  [es:di + 2000h + 80], ax
@@ -3265,6 +3599,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 160], dx
     or  [es:di + 160], ax
@@ -3279,6 +3617,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 2000h + 160], dx
     or  [es:di + 2000h + 160], ax
@@ -3293,6 +3635,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 240], dx
     or  [es:di + 240], ax
@@ -3307,10 +3653,15 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     not dx
     and [es:di + 2000h + 240], dx
     or  [es:di + 2000h + 240], ax
 .sv_row8:
+    pop bx
     pop dx
     pop cx
     pop di
@@ -3332,6 +3683,8 @@ draw_sprites:
 .blit_spr_8x8_inv_go:
     push cx
     push dx
+    push bx
+    mov bx, [cs:spr_xlat]
     mov ax, [si]
     or  ax, ax
     jz short .s_row1_inv
@@ -3342,6 +3695,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di], dx
     not ax
     and [es:di], ax
@@ -3356,6 +3713,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 2000h], dx
     not ax
     and [es:di + 2000h], ax
@@ -3370,6 +3731,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 80], dx
     not ax
     and [es:di + 80], ax
@@ -3384,6 +3749,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 2000h + 80], dx
     not ax
     and [es:di + 2000h + 80], ax
@@ -3398,6 +3767,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 160], dx
     not ax
     and [es:di + 160], ax
@@ -3412,6 +3785,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 2000h + 160], dx
     not ax
     and [es:di + 2000h + 160], ax
@@ -3426,6 +3803,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 240], dx
     not ax
     and [es:di + 240], ax
@@ -3440,10 +3821,15 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 2000h + 240], dx
     not ax
     and [es:di + 2000h + 240], ax
 .s_row8_inv:
+    pop bx
     pop dx
     pop cx
     pop di
@@ -3464,6 +3850,8 @@ draw_sprites:
 .blit_spr_8x8_vflip_inv_go:
     push cx
     push dx
+    push bx
+    mov bx, [cs:spr_xlat]
     mov ax, [si + 14]
     or  ax, ax
     jz short .sv_row1_inv
@@ -3474,6 +3862,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di], dx
     not ax
     and [es:di], ax
@@ -3488,6 +3880,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 2000h], dx
     not ax
     and [es:di + 2000h], ax
@@ -3502,6 +3898,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 80], dx
     not ax
     and [es:di + 80], ax
@@ -3516,6 +3916,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 2000h + 80], dx
     not ax
     and [es:di + 2000h + 80], ax
@@ -3530,6 +3934,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 160], dx
     not ax
     and [es:di + 160], ax
@@ -3544,6 +3952,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 2000h + 160], dx
     not ax
     and [es:di + 2000h + 160], ax
@@ -3558,6 +3970,10 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 240], dx
     not ax
     and [es:di + 240], ax
@@ -3572,10 +3988,15 @@ draw_sprites:
     mov cx, dx
     shl cx, 1
     or  dx, cx
+    xlat                    ; Recolour (mask was taken from the raw pixels)
+    xchg al, ah
+    xlat
+    xchg al, ah
     or  [es:di + 2000h + 240], dx
     not ax
     and [es:di + 2000h + 240], ax
 .sv_row8_inv:
+    pop bx
     pop dx
     pop cx
     pop di
@@ -3755,6 +4176,15 @@ flush_span_di:      dw 0
 flush_sx:           db 0
 flush_span_fn:      dw 0
 full_redraw:        db 1
+bg_seg:             dw 0       ; Background tiles (palette-mapped) + screen tables
+palette_dirty:      db 0
+spr_xlat:           dw XLAT_SPR
+luma_tmp:           times 4 db 0
+new_map:            times 4 db 0
+bg_map:             db 0, 1, 2, 3  ; Current background map (raw value -> CGA colour)
+spr_maps:           db 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3
+levels_bg:          db 0, 2, 1, 3  ; By brightness rank: black, magenta, cyan, white
+levels_spr:         db 0, 1, 3     ; Sprites: black, cyan, white (magenta left to the background)
 save_seg:           dw 0       ; Sprite save-under buffer segment
 save_count:         dw 0       ; Saved 8-line blocks (restored on the next render)
 SAVE_MAX            equ 128    ; 64 sprites x 2 halves (8x16)
