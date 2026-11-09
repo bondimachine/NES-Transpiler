@@ -7,6 +7,23 @@
 const fs = require('fs');
 const path = require('path');
 
+// 6502 index registers: one of X/Y lives in BL (BH kept 0, so BX indexes memory directly),
+// the other in CL (CH kept 0). Chosen per ROM by chooseIndexRegisters().
+let RX8 = 'bl', RY8 = 'cl';
+
+// Peephole fusion sets (filled per ROM): ADC/SBC addresses whose carry-in is known to come
+// from an immediately preceding CLC/SEC, and the CLC/SEC addresses folded into them.
+let fusedCarryOps = new Set(), foldedFlagOps = new Set();
+
+// PLA;PLA pairs proven to discard the current routine's return address (6502 stack depth 0
+// relative to the routine entry). With native CALL/RET they become a single POP of the x86
+// return address. Keyed by the address of the first PLA / second PLA.
+let returnDropFirst = new Set(), returnDropSecond = new Set();
+
+
+// 6502 flag bits used by the liveness analysis
+const F_C = 1, F_Z = 2, F_N = 4, F_V = 8, F_ALL = 15;
+
 const opcodes = {
   0x00: { name: 'BRK', mode: 'imp', len: 1 },
   0x01: { name: 'ORA', mode: 'izx', len: 2 },
@@ -208,9 +225,9 @@ function convertChr(chrBuf) {
   return outBuf;
 }
 
-function transpileRom(romPath, noSound = false) {
+function transpileRom(romPath, noSound = false, bench = false) {
   console.log(`\n============================================================`);
-  console.log(`Transpiling: ${romPath}${noSound ? ' (--nosound)' : ''}`);
+  console.log(`Transpiling: ${romPath}${noSound ? ' (--nosound)' : ''}${bench ? ` (--bench ${bench} frames)` : ''}`);
   console.log(`============================================================`);
 
   const rom = fs.readFileSync(romPath);
@@ -274,7 +291,7 @@ function transpileRom(romPath, noSound = false) {
   const jumpEngines = new Set();
   for (let i = 0; i < prg.length - 20; i++) {
     let pla = 0, pha = 0;
-    for (let p = i; p < i + 22; p++) {
+    for (let p = i; p < i + 40; p++) {
       if (prg[p] === 0x68) pla++;
       if (prg[p] === 0x48) pha++;
       if (prg[p] === 0x6C) {
@@ -297,14 +314,32 @@ function transpileRom(romPath, noSound = false) {
     return !!opcodes[readByte(t)];
   }
 
-  function addTable(addr, isRtsMinus1 = false, maxEntries = 64) {
+  let rtsMinus1Tables = 0;
+  // Plausible code start: the next few instructions all decode (no BRK, stays in ROM)
+  function plausibleCode(t) {
+    let p = t;
+    for (let k = 0; k < 6; k++) {
+      if (!isValidTarget(p) || readByte(p) === 0x00) return false;
+      const inf = opcodes[readByte(p)];
+      if (inf.name === 'RTS' || inf.name === 'JMP' || inf.name === 'RTI') return true;
+      p += inf.len;
+    }
+    return true;
+  }
+
+  // skipInvalid: keep scanning past words that are not code addresses (tables shared with
+  // other data), accepting only entries that decode as plausible code
+  function addTable(addr, isRtsMinus1 = false, maxEntries = 64, skipInvalid = false) {
+    if (isRtsMinus1) rtsMinus1Tables++;
     for (let k = 0; k < maxEntries; k++) {
       const p = addr + k * 2;
       if (p >= 0xFFFA || visited.has(p) || jumpTableTargets.has(p)) break;
       let w = readWord(p);
       if (w === 0 && k === 0) continue; // e.g. 1942 task 0 slot is 0000h
       if (isRtsMinus1) w = (w + 1) & 0xFFFF;
-      if (!isValidTarget(w)) break;
+      if (skipInvalid) {
+        if (!plausibleCode(w)) continue;
+      } else if (!isValidTarget(w)) break;
       dataBytes.add(p);
       dataBytes.add(p + 1);
       dataBytes.delete(w);
@@ -367,6 +402,17 @@ function transpileRom(romPath, noSound = false) {
           }
         }
       }
+      // Pattern D: LDA tbl,Y/X ... INY/INX ... LDA tbl,Y/X (same table, index bumped in
+      // between), e.g. Excitebike: LDA $C000,Y; STA $00; INY; LDA $C000,Y; STA $01; JMP ($0000)
+      if (op === 0xBD || op === 0xB9) {
+        const t1 = readWord(pc + 1);
+        const inc = op === 0xB9 ? 0xC8 : 0xE8;
+        for (let d = 3; d <= 6; d++) {
+          if (readByte(pc + d) === inc && readByte(pc + d + 1) === op && readWord(pc + d + 2) === t1 && t1 >= baseAddr) {
+            addTable(t1, false, 64, true);
+          }
+        }
+      }
       // Pattern C: LDA abs (AD) STA zp (85) LDA abs+1 (AD) STA zp+1 (85)
       if (op === 0xAD && readByte(pc + 3) === 0x85 && readByte(pc + 5) === 0xAD && readByte(pc + 8) === 0x85) {
         const p1 = readWord(pc + 1), p2 = readWord(pc + 6);
@@ -385,8 +431,9 @@ function transpileRom(romPath, noSound = false) {
 ; NES88 AOT Transpiled Binary: ${baseName}.nes
 ; Architecture: Intel 8088 / MS-DOS Real Mode (CGA Mode 4 320x200)
 ; ==============================================================================
-org 100h
+${bench ? `%define BENCH 1\nBENCH_FRAMES equ ${bench}\nBENCH_MAX_TICKS equ ${Math.min(60000, bench * 20)}\n` : ''}org 100h
 cpu 8086
+;@INDEX_REGISTERS@
 
 start:
     mov sp, 0FFFEh
@@ -394,7 +441,8 @@ start:
 
     ; Initialize 6502 CPU registers & segments
     xor ax, ax              ; A = 0
-    xor bx, bx              ; X = 0, Y = 0
+    xor bx, bx              ; X/Y = 0 (BH = 0 invariant)
+    xor cx, cx              ; Y/X = 0 (CH = 0 invariant)
     xor dx, dx              ; DH = 0 invariant
     mov ds, [cs:nes_ram_seg]
     mov es, [cs:xlate_seg]
@@ -412,36 +460,275 @@ loc_unhandled:
 `;
 
   const sortedAddresses = Array.from(visited).sort((a, b) => a - b);
-  const definedLabels = new Set(sortedAddresses);
 
-  // Static liveness check: is the 6502 Carry flag potentially read before being overwritten?
-  const cfOverwriteOps = new Set(['CLC', 'SEC', 'CMP', 'CPX', 'CPY', 'ASL', 'LSR', 'PLP']);
-  const cfReadOps = new Set(['ADC', 'SBC', 'ROL', 'ROR', 'BCC', 'BCS', 'PHP']);
-
-  function isCarryLive(startPc) {
-    let p = startPc;
-    for (let steps = 0; steps < 12; steps++) {
-      if (p < baseAddr || p >= 0xFFFA) return true;
-      const op = readByte(p);
-      const inf = opcodes[op];
-      if (!inf) return true;
-      const nm = inf.name;
-      if (cfOverwriteOps.has(nm)) return false;
-      if (cfReadOps.has(nm)) return true;
-      if (nm === 'JMP' && inf.mode === 'abs') {
-        p = readWord(p + 1);
-        continue;
-      }
-      if (nm === 'JSR' || nm === 'RTS' || nm === 'RTI' || nm === 'JMP' || inf.mode === 'rel') {
-        return true;
-      }
-      p += inf.len;
+  // Give BX to whichever index register makes the reachable code cheaper (extra x86
+  // instructions per access under each assignment, counted statically)
+  {
+    const costXinBx = { aby: 1, zpx: 3, izx: 4, zpy: 4, izy: 2 };
+    const costYinBx = { abx: 1, zpx: 4, izx: 5, zpy: 3 };
+    let cx = 0, cy = 0;
+    for (const pc of sortedAddresses) {
+      const m = opcodes[readByte(pc)].mode;
+      cx += costXinBx[m] || 0;
+      cy += costYinBx[m] || 0;
     }
-    return true;
+    // X-indexed accesses (object tables) tend to be hotter than their static count, so Y
+    // only gets BX when that is clearly cheaper (measured on the bench ROMs)
+    [RX8, RY8] = cy * 3 < cx ? ['cl', 'bl'] : ['bl', 'cl'];
+    if (forceIndexRegs === 'x') [RX8, RY8] = ['bl', 'cl'];   // --index-regs=x: X in BX
+    if (forceIndexRegs === 'y') [RX8, RY8] = ['cl', 'bl'];   // --index-regs=y: Y in BX
+    console.log(`Index registers: X=${RX8.toUpperCase()}, Y=${RY8.toUpperCase()} (static cost ${Math.min(cx, cy)} vs ${Math.max(cx, cy)})`);
+    // Tell the runtime helpers (joypad index reads, STA (zp),Y) which register is which
+    out = out.replace(';@INDEX_REGISTERS@',
+      `%define REG_X ${RX8}\n%define REG_Y ${RY8}\n%define REG_Y16 ${RY8 === 'bl' ? 'bx' : 'cx'}`);
   }
 
-  const useCompactJsr = visited.size >= 8000;
+  // 6502 stack depth of each instruction relative to the entry of the subroutine that
+  // contains it (JSR targets; JSR itself is depth-neutral). null = unknown/conflicting.
+  const stackDepth = computeStackDepths();
+  function computeStackDepths() {
+    const depth = new Map();
+    const entries = new Set();
+    for (const pc of sortedAddresses) {
+      const info = opcodes[readByte(pc)];
+      if (info.name === 'JSR' && !jumpEngines.has(readWord(pc + 1))) entries.add(readWord(pc + 1));
+    }
+    const work = [];
+    for (const e of entries) if (visited.has(e)) work.push([e, 0]);
+    while (work.length) {
+      const [pc, d] = work.pop();
+      if (!visited.has(pc)) continue;
+      if (depth.has(pc)) {
+        if (depth.get(pc) !== d && depth.get(pc) !== null) { depth.set(pc, null); }
+        else continue;
+      } else depth.set(pc, d);
+      const cur = depth.get(pc);
+      const info = opcodes[readByte(pc)];
+      const nd = cur === null ? null : cur + (info.name === 'PHA' || info.name === 'PHP' ? 1 : (info.name === 'PLA' || info.name === 'PLP' ? -1 : 0));
+      const next = [];
+      if (info.name === 'JMP') { if (info.mode === 'abs') next.push(readWord(pc + 1)); }
+      else if (info.name === 'JSR') { if (!jumpEngines.has(readWord(pc + 1))) next.push(pc + 3); }
+      else if (info.name === 'RTS' || info.name === 'RTI' || info.name === 'BRK') { /* leaves */ }
+      else if (info.mode === 'rel') {
+        let off = readByte(pc + 1);
+        if (off >= 128) off -= 256;
+        next.push(pc + 2 + off, pc + 2);
+      } else next.push(pc + info.len);
+      for (const t of next) {
+        if (nd === null) { if (depth.get(t) !== null) work.push([t, null]); }
+        else if (depth.get(t) !== nd) work.push([t, nd]);
+      }
+    }
+    // A conflict must also poison everything downstream: re-propagate nulls
+    return new Map([...depth].map(([k, v]) => [k, v]));
+  }
+
+  // Returns descriptions of code patterns that read or forge return addresses on the
+  // 6502 stack (incompatible with native CALL/RET).
+  function detectStackTricks() {
+    const found = [];
+    if (rtsMinus1Tables > 0) found.push('RTS-1 address tables');
+    for (let i = 0; i < sortedAddresses.length; i++) {
+      const pc = sortedAddresses[i];
+      const info = opcodes[readByte(pc)];
+      // TSX then stack-page indexing ($0100..$01FF,X) shortly after: reading/patching return
+      // addresses (plain $01xx,X loops such as RAM clears are fine)
+      if (info.mode === 'abx' && readWord(pc + 1) >= 0x0100 && readWord(pc + 1) <= 0x01FF) {
+        for (let k = i - 1; k >= 0 && k >= i - 8; k--) {
+          if (opcodes[readByte(sortedAddresses[k])].name === 'TSX') {
+            found.push(`TSX stack access at $${pc.toString(16).toUpperCase()}`);
+            break;
+          }
+        }
+      }
+      // PLA; PLA: discards a return address (e.g. to return two levels up). Fine for native
+      // CALL/RET when provably at routine stack depth 0 (translated to POP), a trick otherwise.
+      if (info.name === 'PLA' && readByte(pc + 1) === 0x68 && visited.has(pc + 1)) {
+        if (stackDepth.get(pc) === 0) {
+          returnDropFirst.add(pc);
+          returnDropSecond.add(pc + 1);
+        } else {
+          found.push(`PLA;PLA return-address pop at $${pc.toString(16).toUpperCase()}`);
+        }
+      }
+      // PHA, PHA ... RTS in straight-line code: pushed-address dispatch
+      if (info.name === 'RTS') {
+        let p = pc, pushes = 0;
+        for (let k = i - 1; k >= 0 && k >= i - 6; k--) {
+          const prev = sortedAddresses[k];
+          const pi = opcodes[readByte(prev)];
+          if (prev + pi.len !== p) break;
+          if (pi.name === 'PHA') pushes++;
+          if (pi.name === 'PLA' || pi.name === 'JSR' || pi.name === 'JMP' || pi.name === 'RTS' || pi.mode === 'rel') break;
+          p = prev;
+        }
+        if (pushes >= 2) found.push(`push-and-RTS dispatch at $${pc.toString(16).toUpperCase()}`);
+      }
+      if (found.length >= 4) break;
+    }
+    return found;
+  }
+  const definedLabels = new Set(sortedAddresses);
+
+  // Global flag liveness (backward dataflow over the CFG): for each instruction, which 6502
+  // flags may be read after it before being overwritten. Lets the code generator skip
+  // flag fix-ups (NZ tests, CMC, carry save/restore) whose result is never observed.
+  // Subroutine boundaries are conservative: JSR, RTS, RTI and indirect jumps see all flags live.
+  const liveOut = computeFlagLiveness();
+
+  // CLC; ADC -> ADD and SEC; SBC -> SUB when the ADC/SBC cannot be reached any other way
+  {
+    const targets = new Set([resetVec, nmiVec, irqVec, ...jumpTableTargets]);
+    for (const pc of sortedAddresses) {
+      const info = opcodes[readByte(pc)];
+      if (info.mode === 'rel') {
+        let off = readByte(pc + 1);
+        if (off >= 128) off -= 256;
+        targets.add(pc + 2 + off);
+      } else if ((info.name === 'JMP' && info.mode === 'abs') || info.name === 'JSR') {
+        targets.add(readWord(pc + 1));
+        if (info.name === 'JSR') targets.add(pc + 3);
+      }
+    }
+    fusedCarryOps = new Set();
+    foldedFlagOps = new Set();
+    for (const pc of sortedAddresses) {
+      const nm = opcodes[readByte(pc)].name;
+      if ((nm === 'CLC' || nm === 'SEC') && visited.has(pc + 1) && !targets.has(pc + 1)) {
+        const next = opcodes[readByte(pc + 1)].name;
+        if ((nm === 'CLC' && next === 'ADC') || (nm === 'SEC' && next === 'SBC')) {
+          fusedCarryOps.add(pc + 1);
+          foldedFlagOps.add(pc);
+        }
+      }
+    }
+    console.log(`Peephole: fused ${fusedCarryOps.size} CLC/ADC and SEC/SBC pairs`);
+
+  }
+
+  function flagUseDef(info) {
+    const n = info.name;
+    switch (n) {
+      case 'ADC': case 'SBC': return { use: F_C, def: F_C | F_Z | F_N | F_V };
+      case 'CMP': case 'CPX': case 'CPY': return { use: 0, def: F_C | F_Z | F_N };
+      case 'ASL': case 'LSR': return { use: 0, def: F_C | F_Z | F_N };
+      case 'ROL': case 'ROR': return { use: F_C, def: F_C | F_Z | F_N };
+      case 'AND': case 'ORA': case 'EOR':
+      case 'LDA': case 'LDX': case 'LDY': case 'TAX': case 'TAY': case 'TXA': case 'TYA':
+      case 'TSX': case 'PLA': case 'INC': case 'DEC': case 'INX': case 'INY': case 'DEX': case 'DEY':
+        return { use: 0, def: F_Z | F_N };
+      case 'BIT': return { use: 0, def: F_Z | F_N | F_V };
+      case 'CLC': case 'SEC': return { use: 0, def: F_C };
+      case 'BEQ': case 'BNE': return { use: F_Z, def: 0 };
+      case 'BMI': case 'BPL': return { use: F_N, def: 0 };
+      case 'BCC': case 'BCS': return { use: F_C, def: 0 };
+      case 'BVC': case 'BVS': return { use: F_V, def: 0 };
+      case 'PHP': return { use: F_ALL, def: 0 };
+      case 'PLP': return { use: 0, def: F_ALL };
+      default: return { use: 0, def: 0 };
+    }
+  }
+
+  function computeFlagLiveness() {
+    const succs = new Map();
+    const preds = new Map();
+    const fixedIn = new Map();     // Instructions whose live-in is forced to F_ALL
+    for (const pc of sortedAddresses) preds.set(pc, []);
+    for (const pc of sortedAddresses) {
+      const info = opcodes[readByte(pc)];
+      let s = [];
+      let opaque = false;          // Control leaves to code we cannot see
+      if (info.name === 'JMP') {
+        if (info.mode === 'abs') s = [readWord(pc + 1)]; else opaque = true;
+      } else if (info.name === 'JSR' || info.name === 'RTS' || info.name === 'RTI' || info.name === 'BRK') {
+        fixedIn.set(pc, true);
+      } else if (info.mode === 'rel') {
+        let off = readByte(pc + 1);
+        if (off >= 128) off -= 256;
+        s = [pc + 2 + off, pc + 2];
+      } else {
+        s = [pc + info.len];
+      }
+      if (s.some(t => !visited.has(t))) opaque = true;
+      succs.set(pc, { list: s.filter(t => visited.has(t)), opaque });
+      for (const t of s) if (preds.has(t)) preds.get(t).push(pc);
+    }
+    const liveIn = new Map();
+    const out = new Map();
+    for (const pc of sortedAddresses) { liveIn.set(pc, F_ALL); out.set(pc, F_ALL); }
+    // Start optimistic (nothing live) for analysable instructions, then iterate to fixpoint
+    for (const pc of sortedAddresses) if (!fixedIn.has(pc)) { liveIn.set(pc, 0); out.set(pc, 0); }
+    const work = [...sortedAddresses].reverse();
+    const inWork = new Set(work);
+    while (work.length) {
+      const pc = work.pop();
+      inWork.delete(pc);
+      if (fixedIn.has(pc)) continue;
+      const sc = succs.get(pc);
+      let o = sc.opaque ? F_ALL : 0;
+      for (const t of sc.list) o |= liveIn.get(t);
+      const { use, def } = flagUseDef(opcodes[readByte(pc)]);
+      const i = use | (o & ~def);
+      out.set(pc, o);
+      if (i !== liveIn.get(pc)) {
+        liveIn.set(pc, i);
+        for (const p of preds.get(pc)) if (!inWork.has(p)) { work.push(p); inWork.add(p); }
+      }
+    }
+    return out;
+  }
+
+  // Native x86 CALL/RET for JSR/RTS is much cheaper than emulating the 6502 return stack,
+  // but breaks code that manipulates return addresses. Use it for large ROMs (needed to
+  // fit 64 KB) and for any ROM where no return-address trick is detected.
+  returnDropFirst = new Set();
+  returnDropSecond = new Set();
+  const stackTricks = detectStackTricks();
+  const useCompactJsr = visited.size >= 8000 || stackTricks.length === 0;
+  console.log(useCompactJsr
+    ? `JSR/RTS: native CALL/RET${stackTricks.length ? ` (forced by size despite: ${stackTricks.join('; ')})` : ''}`
+    : `JSR/RTS: emulated 6502 stack (${stackTricks.join('; ')})`);
+  if (!useCompactJsr) {
+    returnDropFirst = new Set();     // Emulated stack: PLA;PLA works as written
+    returnDropSecond = new Set();
+  } else if (returnDropFirst.size) {
+    console.log(`JSR/RTS: ${returnDropFirst.size} PLA;PLA return-address drop(s) translated to POP`);
+  }
   out = out.replace('loc_unhandled:\n    jmp hle_rts', `loc_unhandled:\n    ${useCompactJsr ? 'ret' : 'jmp hle_rts'}`);
+
+  // Benchmark-only: detect 6502 idle (wait-for-frame) loops that only poll RAM, so the
+  // runtime can measure idle time and count game frames (one per loop exit).
+  const idleHeads = new Set();
+  const idleExits = new Set();
+  if (bench) {
+    const pollOps = new Set(['LDA', 'LDX', 'LDY', 'CMP', 'CPX', 'CPY', 'AND', 'ORA', 'EOR', 'BIT']);
+    for (const pc of sortedAddresses) {
+      const info = opcodes[readByte(pc)];
+      if (info.name === 'JMP' && info.mode === 'abs' && readWord(pc + 1) === pc) {
+        idleHeads.add(pc);
+        continue;
+      }
+      if (info.mode !== 'rel') continue;
+      let off = readByte(pc + 1);
+      if (off >= 128) off -= 256;
+      const head = pc + 2 + off;
+      if (head > pc || pc - head > 12) continue;
+      let p = head, ok = true;
+      while (p < pc) {
+        const ii = opcodes[readByte(p)];
+        if (!ii || !visited.has(p) || !pollOps.has(ii.name)) { ok = false; break; }
+        if (ii.mode === 'zp') { /* RAM */ }
+        else if (ii.mode === 'abs') { if (readWord(p + 1) >= 0x0800) { ok = false; break; } }
+        else if (ii.mode !== 'imm') { ok = false; break; }
+        p += ii.len;
+      }
+      if (ok && p === pc && head < pc) {
+        idleHeads.add(head);
+        idleExits.add(pc);
+      }
+    }
+    console.log(`Bench: ${idleHeads.size} idle loops instrumented`);
+  }
 
   const noFallthroughOps = new Set(['JMP', 'RTS', 'RTI', 'BRK']);
   let overlapFixCount = 0;
@@ -454,8 +741,10 @@ loc_unhandled:
       out += useCompactJsr ? `    ret\n` : `    jmp hle_rts\n`;
       continue;
     }
-    const carryLive = isCarryLive(pc + info.len);
-    out += translateInstruction(pc, op, info, readByte, readWord, baseAddr, definedLabels, carryLive, jumpEngines, useCompactJsr, noSound);
+    const flagsLive = liveOut.get(pc);
+    if (idleHeads.has(pc)) out += `    call bench_idle_enter\n`;
+    out += translateInstruction(pc, op, info, readByte, readWord, baseAddr, definedLabels, flagsLive, jumpEngines, useCompactJsr, noSound);
+    if (idleExits.has(pc)) out += `    call bench_idle_exit\n`;
     const nextSeq = pc + info.len;
     if (!noFallthroughOps.has(info.name) && sortedAddresses[idx + 1] !== nextSeq && definedLabels.has(nextSeq)) {
       out += `    jmp loc_${nextSeq.toString(16).toUpperCase()}\n`;
@@ -471,7 +760,10 @@ loc_unhandled:
   for (const t of jumpTableTargets) {
     if (definedLabels.has(t)) validIndirectTargets.add(t);
   }
-  if (!useCompactJsr) {
+  // Exhaustive scan: any ROM word that points at translated code may be an indirect jump
+  // target. Skipped only for large ROMs, where the 4-byte table entries would not fit in 64 KB.
+  // (Independent of JSR mode: native CALL/RET still needs these for JMP (ind) dispatch.)
+  if (visited.size < 8000) {
     for (let i = 0; i < prgSize - 1; i++) {
       const w = readWord(baseAddr + i);
       if (definedLabels.has(w)) validIndirectTargets.add(w);
@@ -494,22 +786,56 @@ loc_unhandled:
   let cleanedRuntime = runtimeAsm
     .replace("rom_filename:       db 'GAME.CHR', 0", `rom_filename:       db '${chrFileName}', 0`)
     .replace("dump_filename:      db 'DUMP.BIN', 0", `dump_filename:      db '${baseName.toUpperCase()}.DMP', 0`)
+    .replace("bench_filename:     db 'BENCH.BEN', 0", `bench_filename:     db '${baseName.toUpperCase()}.BEN', 0`)
+    .replace("bench_script:       dw 0FFFFh", `bench_script:\n${benchScriptAsm(benchScript)}    dw 0FFFFh`)
     .replace('nmi_vector_dispatch:\n    ret', `nmi_vector_dispatch:\n    jmp loc_${nmiVec.toString(16).toUpperCase()}`)
     .replace('indirect_jump_count: dw 0\nindirect_jump_table: dw 0', jumpTableAsm);
   if (noSound) {
     cleanedRuntime = cleanedRuntime.replace('sound_enabled:      db 1', 'sound_enabled:      db 0');
   }
+  if (bench && !out.includes('call hle_write_4016')) {
+    console.log('Bench: no $4016 strobe found, counting NMIs as game frames');
+    out = '%define BENCH_NMI_FRAMES 1\n' + out;
+  }
   out += '\n' + cleanedRuntime;
 
   const outAsmFile = `${baseName}.asm`;
   fs.writeFileSync(outAsmFile, out);
+  if (bench) {
+    // Routine entry points (for the bench profiler to attribute samples to 6502 subroutines)
+    const entries = new Set([resetVec, nmiVec, irqVec, ...jumpTableTargets]);
+    for (const pc of sortedAddresses) {
+      const info = opcodes[readByte(pc)];
+      if (info.name === 'JSR') entries.add(readWord(pc + 1));
+    }
+    fs.writeFileSync(`${baseName}.routines.json`, JSON.stringify({
+      reset: resetVec, nmi: nmiVec, entries: [...entries].filter(e => definedLabels.has(e)).sort((x, y) => x - y)
+    }));
+  }
   console.log(`Generated NASM assembly: ${outAsmFile} (${(out.length / 1024).toFixed(1)} KB, ${indirectList.length} xlate targets)`);
 
   return outAsmFile;
 }
 
-function translateInstruction(pc, op, info, readByte, readWord, baseAddr, definedLabels, carryLive, jumpEngines, useCompactJsr, noSound = false) {
+// Bench input script: comma-separated "first-end:buttons[/period:on]" entries (frames, hex
+// buttons: 01=A 02=B 04=Select 08=Start 10=Up 20=Down 40=Left 80=Right; period power of 2).
+const DEFAULT_BENCH_SCRIPT = '30-40:08,90-100:08,150-65535:82,150-65535:01/32:8';
+function benchScriptAsm(script) {
   let s = '';
+  for (const e of script.split(',')) {
+    const m = e.trim().match(/^(\d+)-(\d+):([0-9a-fA-F]{1,2})(?:\/(\d+):(\d+))?$/);
+    if (!m) throw new Error(`Bad bench script entry: ${e}`);
+    const period = m[4] ? parseInt(m[4], 10) : 0;
+    if (period && (period & (period - 1))) throw new Error(`Bench script period must be a power of 2: ${e}`);
+    s += `    dw ${m[1]}, ${m[2]}\n    db 0${m[3]}h, ${period ? period - 1 : 0}, ${period ? m[5] : 1}\n`;
+  }
+  return s;
+}
+
+function translateInstruction(pc, op, info, readByte, readWord, baseAddr, definedLabels, flagsLive, jumpEngines, useCompactJsr, noSound = false) {
+  let s = '';
+  const carryLive = (flagsLive & F_C) !== 0;
+  const nzLive = (flagsLive & (F_Z | F_N)) !== 0;
   const name = info.name;
   const mode = info.mode;
 
@@ -525,19 +851,37 @@ function translateInstruction(pc, op, info, readByte, readWord, baseAddr, define
 
   // Flag-setting helper for loads/transfers: sets ZF and SF while preserving CF when live
   function setNZ(reg) {
+    if (!nzLive) return '';
     if (carryLive) return `    inc ${reg}\n    dec ${reg}\n`;
     return `    test ${reg}, ${reg}\n`;
   }
 
-  // Effective address computation into [si] or [si + disp16] without touching flags
+  function cmcIfLive() { return carryLive ? `    cmc\n` : ''; }
+
+  // Effective address computation without touching flags. X and Y live in BL/CL (or CL/BL,
+  // chosen per ROM); the one held in BX (BH = 0) indexes memory directly, the other is
+  // copied to SI. Zero-page indexing wraps within page 0 like the 6502.
+  // Returns { pre, mem, post }: post (if any) must follow the instruction using mem.
   function loadEA(m) {
-    if (m === 'zpx') return { pre: `    mov dl, ${zp8()}\n    call ea_zpx\n`, mem: '[si]' };
-    if (m === 'zpy') return { pre: `    mov dl, ${zp8()}\n    call ea_zpy\n`, mem: '[si]' };
-    if (m === 'izx') return { pre: `    mov dl, ${zp8()}\n    call ea_izx\n`, mem: '[si]' };
-    if (m === 'izy') return { pre: `    mov si, [${zp8()}]\n    call ea_izy\n`, mem: '[si]' };
-    if (m === 'abx') return { pre: `    mov dl, bl\n    mov dh, 0\n    mov si, dx\n`, mem: `[si + ${abs16()}]` };
-    if (m === 'aby') return { pre: `    mov dl, bh\n    mov dh, 0\n    mov si, dx\n`, mem: `[si + ${abs16()}]` };
-    return { pre: '', mem: `[${abs16()}]` };
+    const xInBx = RX8 === 'bl';
+    const isX = m === 'abx' || m === 'zpx' || m === 'izx';
+    const inBx = isX === xInBx;
+    if (m === 'abx' || m === 'aby') {
+      return inBx ? { pre: '', mem: `[bx + ${abs16()}]`, post: '' }
+                  : { pre: `    mov si, cx\n`, mem: `[si + ${abs16()}]`, post: '' };
+    }
+    if (m === 'zpx' || m === 'zpy' || m === 'izx') {
+      const wrap = (inBx ? `    lea dx, [bx + ${zp8()}]\n` : `    mov si, cx\n    lea dx, [si + ${zp8()}]\n`) +
+                   `    mov dh, 0\n    mov si, dx\n`;
+      if (m === 'izx') return { pre: wrap + `    mov si, [si]\n`, mem: '[si]', post: '' };
+      return { pre: wrap, mem: '[si]', post: '' };
+    }
+    if (m === 'izy') {
+      if (inBx) return { pre: `    mov si, [${zp8()}]\n`, mem: '[bx + si]', post: '' };
+      // Y is in CX: swap it into BX (XCHG leaves flags alone) around the access
+      return { pre: `    mov si, [${zp8()}]\n    xchg bx, cx\n`, mem: '[bx + si]', post: `    xchg bx, cx\n` };
+    }
+    return { pre: '', mem: `[${abs16()}]`, post: '' };
   }
 
   // Helper for PPU/IO read into a register (al, bl, bh)
@@ -614,25 +958,27 @@ function translateInstruction(pc, op, info, readByte, readWord, baseAddr, define
     else if (mode === 'abs') s += emitReadAbs('al', absVal());
     else if (mode === 'abx' && absVal() === 0x4016) {
       s += `    call hle_read_4016_x\n` + setNZ('al');
+    } else if (mode === 'aby' && absVal() === 0x4016) {
+      s += `    call hle_read_4016_y\n` + setNZ('al');
     } else {
       const ea = loadEA(mode);
       s += ea.pre + `    mov al, ${ea.mem}\n` + setNZ('al');
     }
   } else if (name === 'LDX') {
-    if (mode === 'imm') s += `    mov bl, ${imm8()}\n` + setNZ('bl');
-    else if (mode === 'zp') s += `    mov bl, [${zp8()}]\n` + setNZ('bl');
-    else if (mode === 'abs') s += emitReadAbs('bl', absVal());
+    if (mode === 'imm') s += `    mov ${RX8}, ${imm8()}\n` + setNZ(RX8);
+    else if (mode === 'zp') s += `    mov ${RX8}, [${zp8()}]\n` + setNZ(RX8);
+    else if (mode === 'abs') s += emitReadAbs(RX8, absVal());
     else {
       const ea = loadEA(mode);
-      s += ea.pre + `    mov bl, ${ea.mem}\n` + setNZ('bl');
+      s += ea.pre + `    mov ${RX8}, ${ea.mem}\n` + setNZ(RX8);
     }
   } else if (name === 'LDY') {
-    if (mode === 'imm') s += `    mov bh, ${imm8()}\n` + setNZ('bh');
-    else if (mode === 'zp') s += `    mov bh, [${zp8()}]\n` + setNZ('bh');
-    else if (mode === 'abs') s += emitReadAbs('bh', absVal());
+    if (mode === 'imm') s += `    mov ${RY8}, ${imm8()}\n` + setNZ(RY8);
+    else if (mode === 'zp') s += `    mov ${RY8}, [${zp8()}]\n` + setNZ(RY8);
+    else if (mode === 'abs') s += emitReadAbs(RY8, absVal());
     else {
       const ea = loadEA(mode);
-      s += ea.pre + `    mov bh, ${ea.mem}\n` + setNZ('bh');
+      s += ea.pre + `    mov ${RY8}, ${ea.mem}\n` + setNZ(RY8);
     }
   }
 
@@ -655,37 +1001,40 @@ function translateInstruction(pc, op, info, readByte, readWord, baseAddr, define
       s += `    mov si, [${zp8()}]\n    call hle_sta_izy\n`;
     }
   } else if (name === 'STX') {
-    if (mode === 'zp') s += `    mov [${zp8()}], bl\n`;
-    else if (mode === 'abs') s += emitWriteAbs('bl', absVal());
+    if (mode === 'zp') s += `    mov [${zp8()}], ${RX8}\n`;
+    else if (mode === 'abs') s += emitWriteAbs(RX8, absVal());
     else {
       const ea = loadEA(mode);
-      s += ea.pre + `    mov ${ea.mem}, bl\n`;
+      s += ea.pre + `    mov ${ea.mem}, ${RX8}\n`;
     }
   } else if (name === 'STY') {
-    if (mode === 'zp') s += `    mov [${zp8()}], bh\n`;
-    else if (mode === 'abs') s += emitWriteAbs('bh', absVal());
+    if (mode === 'zp') s += `    mov [${zp8()}], ${RY8}\n`;
+    else if (mode === 'abs') s += emitWriteAbs(RY8, absVal());
     else {
       const ea = loadEA(mode);
-      s += ea.pre + `    mov ${ea.mem}, bh\n`;
+      s += ea.pre + `    mov ${ea.mem}, ${RY8}\n`;
     }
   }
 
   // 3. ARITHMETIC & LOGIC
   else if (name === 'ADC') {
-    if (mode === 'imm') s += `    adc al, ${imm8()}\n`;
-    else if (mode === 'zp') s += `    adc al, [${zp8()}]\n`;
-    else if (mode === 'abs') s += `    adc al, [${abs16()}]\n`;
+    const xop = fusedCarryOps.has(pc) ? 'add' : 'adc';     // CLC folded in
+    if (mode === 'imm') s += `    ${xop} al, ${imm8()}\n`;
+    else if (mode === 'zp') s += `    ${xop} al, [${zp8()}]\n`;
+    else if (mode === 'abs') s += `    ${xop} al, [${abs16()}]\n`;
     else {
       const ea = loadEA(mode);
-      s += ea.pre + `    adc al, ${ea.mem}\n`;
+      s += ea.pre + `    ${xop} al, ${ea.mem}\n`;
     }
   } else if (name === 'SBC') {
-    if (mode === 'imm') s += `    cmc\n    sbb al, ${imm8()}\n    cmc\n`;
-    else if (mode === 'zp') s += `    cmc\n    sbb al, [${zp8()}]\n    cmc\n`;
-    else if (mode === 'abs') s += `    cmc\n    sbb al, [${abs16()}]\n    cmc\n`;
+    // 6502 carry = NOT x86 borrow: CMC in, SBB, CMC out. With SEC folded in it is a plain SUB.
+    const pre = fusedCarryOps.has(pc) ? `    sub al, ` : `    cmc\n    sbb al, `;
+    if (mode === 'imm') s += `${pre}${imm8()}\n` + cmcIfLive();
+    else if (mode === 'zp') s += `${pre}[${zp8()}]\n` + cmcIfLive();
+    else if (mode === 'abs') s += `${pre}[${abs16()}]\n` + cmcIfLive();
     else {
       const ea = loadEA(mode);
-      s += ea.pre + `    cmc\n    sbb al, ${ea.mem}\n    cmc\n`;
+      s += ea.pre + `${pre}${ea.mem}\n` + cmcIfLive();
     }
   } else if (name === 'AND' || name === 'ORA' || name === 'EOR') {
     const xop = name === 'AND' ? 'and' : (name === 'ORA' ? 'or' : 'xor');
@@ -702,38 +1051,48 @@ function translateInstruction(pc, op, info, readByte, readWord, baseAddr, define
 
   // 4. COMPARISONS (6502 Carry is inverted relative to x86 borrow: CMC)
   else if (name === 'CMP') {
-    if (mode === 'imm') s += `    cmp al, ${imm8()}\n    cmc\n`;
-    else if (mode === 'zp') s += `    cmp al, [${zp8()}]\n    cmc\n`;
-    else if (mode === 'abs') s += `    cmp al, [${abs16()}]\n    cmc\n`;
+    if (mode === 'imm') s += `    cmp al, ${imm8()}\n` + cmcIfLive();
+    else if (mode === 'zp') s += `    cmp al, [${zp8()}]\n` + cmcIfLive();
+    else if (mode === 'abs') s += `    cmp al, [${abs16()}]\n` + cmcIfLive();
     else {
       const ea = loadEA(mode);
-      s += ea.pre + `    cmp al, ${ea.mem}\n    cmc\n`;
+      s += ea.pre + `    cmp al, ${ea.mem}\n` + cmcIfLive();
     }
   } else if (name === 'CPX') {
-    if (mode === 'imm') s += `    cmp bl, ${imm8()}\n    cmc\n`;
-    else if (mode === 'zp') s += `    cmp bl, [${zp8()}]\n    cmc\n`;
-    else if (mode === 'abs') s += `    cmp bl, [${abs16()}]\n    cmc\n`;
+    if (mode === 'imm') s += `    cmp ${RX8}, ${imm8()}\n` + cmcIfLive();
+    else if (mode === 'zp') s += `    cmp ${RX8}, [${zp8()}]\n` + cmcIfLive();
+    else if (mode === 'abs') s += `    cmp ${RX8}, [${abs16()}]\n` + cmcIfLive();
   } else if (name === 'CPY') {
-    if (mode === 'imm') s += `    cmp bh, ${imm8()}\n    cmc\n`;
-    else if (mode === 'zp') s += `    cmp bh, [${zp8()}]\n    cmc\n`;
-    else if (mode === 'abs') s += `    cmp bh, [${abs16()}]\n    cmc\n`;
+    if (mode === 'imm') s += `    cmp ${RY8}, ${imm8()}\n` + cmcIfLive();
+    else if (mode === 'zp') s += `    cmp ${RY8}, [${zp8()}]\n` + cmcIfLive();
+    else if (mode === 'abs') s += `    cmp ${RY8}, [${abs16()}]\n` + cmcIfLive();
   }
 
   // 5. BIT TEST (Preserves AL and CF; sets ZF = (AL & mem)==0, SF = mem.7, OF = mem.6)
   else if (name === 'BIT') {
-    if (mode === 'zp') s += `    mov dl, [${zp8()}]\n    call hle_bit\n`;
-    else if (mode === 'abs') {
-      const a = absVal();
-      if (a === 0x2002) s += `    call hle_bit_2002\n`;
-      else s += `    mov dl, [${abs16()}]\n    call hle_bit\n`;
+    const a = mode === 'zp' ? readByte(pc + 1) : absVal();
+    const src = mode === 'zp' ? `[${zp8()}]` : `[${abs16()}]`;
+    const needZ = (flagsLive & F_Z) !== 0, needN = (flagsLive & F_N) !== 0, needV = (flagsLive & F_V) !== 0;
+    const cfSave = carryLive ? `    rcr dh, 1\n` : '';
+    const cfRest = carryLive ? `    rol dh, 1\n` : '';
+    const load = a === 0x2002 ? `    call hle_read_2002_dl\n` : `    mov dl, ${src}\n`;
+    if (!needZ && !needN && !needV) {
+      if (a === 0x2002) s += `    call hle_read_2002_dl\n`;   // Keep the read side effects
+      else s += `    ; BIT (flags unused)\n`;
+    } else if (!needV && !(needZ && needN)) {
+      s += load + cfSave + (needZ ? `    test dl, al\n` : `    test dl, 80h\n`) + cfRest;
+    } else if (a === 0x2002) {
+      s += `    call hle_bit_2002\n`;
+    } else {
+      s += `    mov dl, ${src}\n    call hle_bit\n`;
     }
   }
 
   // 6. INCREMENT & DECREMENT (x86 inc/dec sets ZF and SF and preserves CF!)
-  else if (name === 'INX') s += `    inc bl\n`;
-  else if (name === 'DEX') s += `    dec bl\n`;
-  else if (name === 'INY') s += `    inc bh\n`;
-  else if (name === 'DEY') s += `    dec bh\n`;
+  else if (name === 'INX') s += `    inc ${RX8}\n`;
+  else if (name === 'DEX') s += `    dec ${RX8}\n`;
+  else if (name === 'INY') s += `    inc ${RY8}\n`;
+  else if (name === 'DEY') s += `    dec ${RY8}\n`;
   else if (name === 'INC') {
     if (mode === 'zp') s += `    inc byte [${zp8()}]\n`;
     else if (mode === 'abs') s += `    inc byte [${abs16()}]\n`;
@@ -767,34 +1126,28 @@ function translateInstruction(pc, op, info, readByte, readWord, baseAddr, define
       const ea = loadEA(mode);
       s += ea.pre + `    shr byte ${ea.mem}, 1\n`;
     }
-  } else if (name === 'ROL') {
-    if (mode === 'acc') s += `    rcl al, 1\n    inc al\n    dec al\n`;
-    else if (mode === 'zp') s += `    mov dl, [${zp8()}]\n    rcl dl, 1\n    inc dl\n    dec dl\n    mov [${zp8()}], dl\n`;
-    else if (mode === 'abs') s += `    mov dl, [${abs16()}]\n    rcl dl, 1\n    inc dl\n    dec dl\n    mov [${abs16()}], dl\n`;
+  } else if (name === 'ROL' || name === 'ROR') {
+    const xop = name === 'ROL' ? 'rcl' : 'rcr';
+    if (mode === 'acc') s += `    ${xop} al, 1\n` + (nzLive ? `    inc al\n    dec al\n` : '');
     else {
-      const ea = loadEA(mode);
-      s += ea.pre + `    mov dl, ${ea.mem}\n    rcl dl, 1\n    inc dl\n    dec dl\n    mov ${ea.mem}, dl\n`;
-    }
-  } else if (name === 'ROR') {
-    if (mode === 'acc') s += `    rcr al, 1\n    inc al\n    dec al\n`;
-    else if (mode === 'zp') s += `    mov dl, [${zp8()}]\n    rcr dl, 1\n    inc dl\n    dec dl\n    mov [${zp8()}], dl\n`;
-    else if (mode === 'abs') s += `    mov dl, [${abs16()}]\n    rcr dl, 1\n    inc dl\n    dec dl\n    mov [${abs16()}], dl\n`;
-    else {
-      const ea = loadEA(mode);
-      s += ea.pre + `    mov dl, ${ea.mem}\n    rcr dl, 1\n    inc dl\n    dec dl\n    mov ${ea.mem}, dl\n`;
+      const ea = mode === 'zp' ? { pre: '', mem: `[${zp8()}]` } : (mode === 'abs' ? { pre: '', mem: `[${abs16()}]` } : loadEA(mode));
+      if (!nzLive) s += ea.pre + `    ${xop} byte ${ea.mem}, 1\n`;
+      else s += ea.pre + `    mov dl, ${ea.mem}\n    ${xop} dl, 1\n    inc dl\n    dec dl\n    mov ${ea.mem}, dl\n`;
     }
   }
 
   // 8. TRANSFERS
-  else if (name === 'TAX') s += `    mov bl, al\n` + setNZ('bl');
-  else if (name === 'TAY') s += `    mov bh, al\n` + setNZ('bh');
-  else if (name === 'TXA') s += `    mov al, bl\n` + setNZ('al');
-  else if (name === 'TYA') s += `    mov al, bh\n` + setNZ('al');
-  else if (name === 'TSX') s += `    mov dx, di\n    mov bl, dl\n    mov dh, 0\n` + setNZ('bl');
-  else if (name === 'TXS') s += `    mov dl, bl\n    mov dh, 01h\n    mov di, dx\n    mov dh, 0\n`;
+  else if (name === 'TAX') s += `    mov ${RX8}, al\n` + setNZ(RX8);
+  else if (name === 'TAY') s += `    mov ${RY8}, al\n` + setNZ(RY8);
+  else if (name === 'TXA') s += `    mov al, ${RX8}\n` + setNZ('al');
+  else if (name === 'TYA') s += `    mov al, ${RY8}\n` + setNZ('al');
+  else if (name === 'TSX') s += `    mov dx, di\n    mov ${RX8}, dl\n    mov dh, 0\n` + setNZ(RX8);
+  else if (name === 'TXS') s += `    mov dl, ${RX8}\n    mov dh, 01h\n    mov di, dx\n    mov dh, 0\n`;
 
   // 9. STACK (Interrupt-safe & flag-preserving 6502 stack in DS:[DI])
   else if (name === 'PHA') s += `    lea di, [di - 1]\n    mov [di + 1], al\n`;
+  else if (name === 'PLA' && returnDropFirst.has(pc)) s += `    pop si                  ; PLA;PLA: drop this routine's native return address\n`;
+  else if (name === 'PLA' && returnDropSecond.has(pc)) s += `    ; PLA (second byte of the dropped return address)\n`;
   else if (name === 'PLA') s += `    lea di, [di + 1]\n    mov al, [di]\n` + setNZ('al');
   else if (name === 'PHP') s += `    lahf\n    lea di, [di - 1]\n    mov [di + 1], ah\n`;
   else if (name === 'PLP') s += `    lea di, [di + 1]\n    mov ah, [di]\n    sahf\n`;
@@ -828,7 +1181,9 @@ function translateInstruction(pc, op, info, readByte, readWord, baseAddr, define
     const target = absVal();
     if (!useCompactJsr || jumpEngines.has(target)) {
       const ret6502 = '0' + ((pc + 2) & 0xFFFF).toString(16).toUpperCase().padStart(4, '0') + 'h';
-      s += `    call hle_jsr\n    dw ${ret6502}, ${getLabel(target)}\n`;
+      // Emulated 6502 JSR, inlined: push the return address (PC + 2) on the 6502 stack and
+      // jump (LEA / MOV / JMP leave the flags alone, like the hle_jsr helper did)
+      s += `    lea di, [di - 2]\n    mov word [di + 1], ${ret6502}\n    jmp ${getLabel(target)}\n`;
     } else {
       s += `    call ${getLabel(target)}\n`;
     }
@@ -839,8 +1194,8 @@ function translateInstruction(pc, op, info, readByte, readWord, baseAddr, define
   }
 
   // 12. FLAGS & MISC
-  else if (name === 'CLC') s += `    clc\n`;
-  else if (name === 'SEC') s += `    stc\n`;
+  else if (name === 'CLC') s += foldedFlagOps.has(pc) ? `    ; CLC (folded into ADD)\n` : `    clc\n`;
+  else if (name === 'SEC') s += foldedFlagOps.has(pc) ? `    ; SEC (folded into SUB)\n` : `    stc\n`;
   else if (name === 'CLD') s += `    cld\n`;
   else if (name === 'SED') s += `    ; SED\n`;
   else if (name === 'CLI') s += `    ; CLI (6502 IRQ enable)\n`;
@@ -856,10 +1211,26 @@ function translateInstruction(pc, op, info, readByte, readWord, baseAddr, define
     throw new Error(`Empty translation for ${name} (${mode}) at $${pc.toString(16)}`);
   }
 
+  // (zp),Y with Y in CX swaps BX/CX around the access: swap back right after it
+  if (mode === 'izy' && RY8 === 'cl' && s.includes('[bx + si]')) {
+    const lines = s.split('\n');
+    const k = lines.findIndex(l => l.includes('[bx + si]'));
+    lines.splice(k + 1, 0, '    xchg bx, cx');
+    s = lines.join('\n');
+  }
+
   return s;
 }
 
 const cliArgs = process.argv.slice(2);
 const noSoundFlag = cliArgs.includes('--nosound') || cliArgs.includes('-nosound') || cliArgs.includes('/nosound');
+// --bench[=frames]: build an instrumented binary that plays a scripted input sequence for
+// <frames> game frames (joypad strobes, default 600), then writes <GAME>.BEN stats and <GAME>.DMP.
+const benchArg = cliArgs.find(a => /^--bench(=\d+)?$/.test(a));
+const benchTicks = benchArg ? (parseInt(benchArg.split('=')[1], 10) || 600) : false;
+const regsArg = cliArgs.find(a => a.startsWith('--index-regs='));
+const forceIndexRegs = regsArg ? regsArg.slice('--index-regs='.length) : null;
+const scriptArg = cliArgs.find(a => a.startsWith('--bench-script='));
+const benchScript = scriptArg ? scriptArg.slice('--bench-script='.length) : DEFAULT_BENCH_SCRIPT;
 const romFile = cliArgs.find(a => !a.startsWith('-') && !a.startsWith('/')) || 'nuts.nes';
-transpileRom(romFile, noSoundFlag);
+transpileRom(romFile, noSoundFlag, benchTicks);

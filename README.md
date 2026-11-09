@@ -57,6 +57,9 @@ dosbox -c "mount c ." -c "c:" -c "game.com"
 
 # Run with PC Speaker disabled at runtime (zero PIT/speaker overhead):
 dosbox -c "mount c ." -c "c:" -c "game.com --nosound"
+
+# Start with inverted colours (better contrast on some LCDs; key I toggles in-game):
+dosbox -c "mount c ." -c "c:" -c "game.com --invert"
 ```
 
 > **Note:** Both `<game>.com` and `<game>.chr` must be present in the current working directory when launching the game.
@@ -72,7 +75,8 @@ dosbox -c "mount c ." -c "c:" -c "game.com --nosound"
 | **B Button** | `X` | `K` |
 | **Start** | `Enter` | `Space` |
 | **Select** | `Tab` | `Left Shift` or `C` |
-| **Frameskip (`F1`–`F9` HUD)** | `1` – `9` | `1` = 60 FPS, `3` = 20 FPS (default), ..., `9` = 6.7 FPS |
+| **Frameskip (`F1`–`F9` HUD)** | `1` – `9` | Minimum ticks per screen update: `1` = up to 60 FPS, `3` = up to 20 FPS (default), ..., `9` = 6.7 FPS. When the game can't keep up, the runtime automatically renders less often (down to every 8 ticks) to give the game logic more CPU, and returns to the minimum when there is headroom. |
+| **Invert Colours** | `I` | Toggles inverted colours (black ↔ white, cyan ↔ magenta) for low-contrast LCDs. Also `--invert` on the command line. |
 | **Toggle Sound Mute** | `0` | Mutes/unmutes PC Speaker output at runtime |
 | **Exit to DOS** | `ESC` | Restores 80x25 text mode, silences speaker, and restores BIOS interrupts |
 
