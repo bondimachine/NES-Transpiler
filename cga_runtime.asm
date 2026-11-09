@@ -1294,7 +1294,7 @@ cga_tile_wrapped:
 
 ; Sprite blit that wraps past the end of the bank ring (byte by byte). DI = wrapped CGA
 ; offset (may be odd), DS:SI = tile, CS:BX = row order table (8 source word offsets for
-; even0, odd0, even1, odd1, ...). ORs (or AND-NOTs when inverted) non-zero pixels.
+; even0, odd0, even1, odd1, ...). Non-transparent pixels replace the background.
 spr_wrapped:
     push ax
     push cx
@@ -1337,13 +1337,26 @@ spr_wrapped:
     pop ax
     ret
 .put_byte:
+    push bx
+    mov bl, al              ; BL = mask: 11b for every non-transparent pixel
+    shr bl, 1
+    or  bl, al
+    and bl, 55h
+    mov bh, bl
+    shl bh, 1
+    or  bl, bh
     cmp byte [cs:invert_on], 0
     jne short .put_inv
-    or [es:di], al
+    not bl
+    and [es:di], bl
+    or  [es:di], al
+    pop bx
     ret
 .put_inv:
+    or  [es:di], bl
     not al
     and [es:di], al
+    pop bx
     ret
 
 spr_order_normal:   dw 0, 8, 2, 10, 4, 12, 6, 14
@@ -3052,46 +3065,122 @@ draw_sprites:
     pop di
     ret
 .blit_spr_8x8_go:
+    push cx
+    push dx
     mov ax, [si]
     or  ax, ax
     jz short .s_row1
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di], dx
     or  [es:di], ax
 .s_row1:
     mov ax, [si + 8]
     or  ax, ax
     jz short .s_row2
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 2000h], dx
     or  [es:di + 2000h], ax
 .s_row2:
     mov ax, [si + 2]
     or  ax, ax
     jz short .s_row3
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 80], dx
     or  [es:di + 80], ax
 .s_row3:
     mov ax, [si + 10]
     or  ax, ax
     jz short .s_row4
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 2000h + 80], dx
     or  [es:di + 2000h + 80], ax
 .s_row4:
     mov ax, [si + 4]
     or  ax, ax
     jz short .s_row5
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 160], dx
     or  [es:di + 160], ax
 .s_row5:
     mov ax, [si + 12]
     or  ax, ax
     jz short .s_row6
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 2000h + 160], dx
     or  [es:di + 2000h + 160], ax
 .s_row6:
     mov ax, [si + 6]
     or  ax, ax
     jz short .s_row7
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 240], dx
     or  [es:di + 240], ax
 .s_row7:
     mov ax, [si + 14]
     or  ax, ax
     jz short .s_row8
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 2000h + 240], dx
     or  [es:di + 2000h + 240], ax
 .s_row8:
+    pop dx
+    pop cx
     pop di
     ret
 
@@ -3108,46 +3197,122 @@ draw_sprites:
     pop di
     ret
 .blit_spr_8x8_vflip_go:
+    push cx
+    push dx
     mov ax, [si + 14]
     or  ax, ax
     jz short .sv_row1
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di], dx
     or  [es:di], ax
 .sv_row1:
     mov ax, [si + 6]
     or  ax, ax
     jz short .sv_row2
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 2000h], dx
     or  [es:di + 2000h], ax
 .sv_row2:
     mov ax, [si + 12]
     or  ax, ax
     jz short .sv_row3
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 80], dx
     or  [es:di + 80], ax
 .sv_row3:
     mov ax, [si + 4]
     or  ax, ax
     jz short .sv_row4
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 2000h + 80], dx
     or  [es:di + 2000h + 80], ax
 .sv_row4:
     mov ax, [si + 10]
     or  ax, ax
     jz short .sv_row5
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 160], dx
     or  [es:di + 160], ax
 .sv_row5:
     mov ax, [si + 2]
     or  ax, ax
     jz short .sv_row6
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 2000h + 160], dx
     or  [es:di + 2000h + 160], ax
 .sv_row6:
     mov ax, [si + 8]
     or  ax, ax
     jz short .sv_row7
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 240], dx
     or  [es:di + 240], ax
 .sv_row7:
     mov ax, [si]
     or  ax, ax
     jz short .sv_row8
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    not dx
+    and [es:di + 2000h + 240], dx
     or  [es:di + 2000h + 240], ax
 .sv_row8:
+    pop dx
+    pop cx
     pop di
     ret
 
@@ -3165,54 +3330,122 @@ draw_sprites:
     pop di
     ret
 .blit_spr_8x8_inv_go:
+    push cx
+    push dx
     mov ax, [si]
     or  ax, ax
     jz short .s_row1_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di], dx
     not ax
     and [es:di], ax
 .s_row1_inv:
     mov ax, [si + 8]
     or  ax, ax
     jz short .s_row2_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 2000h], dx
     not ax
     and [es:di + 2000h], ax
 .s_row2_inv:
     mov ax, [si + 2]
     or  ax, ax
     jz short .s_row3_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 80], dx
     not ax
     and [es:di + 80], ax
 .s_row3_inv:
     mov ax, [si + 10]
     or  ax, ax
     jz short .s_row4_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 2000h + 80], dx
     not ax
     and [es:di + 2000h + 80], ax
 .s_row4_inv:
     mov ax, [si + 4]
     or  ax, ax
     jz short .s_row5_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 160], dx
     not ax
     and [es:di + 160], ax
 .s_row5_inv:
     mov ax, [si + 12]
     or  ax, ax
     jz short .s_row6_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 2000h + 160], dx
     not ax
     and [es:di + 2000h + 160], ax
 .s_row6_inv:
     mov ax, [si + 6]
     or  ax, ax
     jz short .s_row7_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 240], dx
     not ax
     and [es:di + 240], ax
 .s_row7_inv:
     mov ax, [si + 14]
     or  ax, ax
     jz short .s_row8_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 2000h + 240], dx
     not ax
     and [es:di + 2000h + 240], ax
 .s_row8_inv:
+    pop dx
+    pop cx
     pop di
     ret
 
@@ -3229,54 +3462,122 @@ draw_sprites:
     pop di
     ret
 .blit_spr_8x8_vflip_inv_go:
+    push cx
+    push dx
     mov ax, [si + 14]
     or  ax, ax
     jz short .sv_row1_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di], dx
     not ax
     and [es:di], ax
 .sv_row1_inv:
     mov ax, [si + 6]
     or  ax, ax
     jz short .sv_row2_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 2000h], dx
     not ax
     and [es:di + 2000h], ax
 .sv_row2_inv:
     mov ax, [si + 12]
     or  ax, ax
     jz short .sv_row3_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 80], dx
     not ax
     and [es:di + 80], ax
 .sv_row3_inv:
     mov ax, [si + 4]
     or  ax, ax
     jz short .sv_row4_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 2000h + 80], dx
     not ax
     and [es:di + 2000h + 80], ax
 .sv_row4_inv:
     mov ax, [si + 10]
     or  ax, ax
     jz short .sv_row5_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 160], dx
     not ax
     and [es:di + 160], ax
 .sv_row5_inv:
     mov ax, [si + 2]
     or  ax, ax
     jz short .sv_row6_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 2000h + 160], dx
     not ax
     and [es:di + 2000h + 160], ax
 .sv_row6_inv:
     mov ax, [si + 8]
     or  ax, ax
     jz short .sv_row7_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 240], dx
     not ax
     and [es:di + 240], ax
 .sv_row7_inv:
     mov ax, [si]
     or  ax, ax
     jz short .sv_row8_inv
+    mov dx, ax              ; DX = mask: 11b for every non-transparent pixel
+    shr dx, 1
+    or  dx, ax
+    and dx, 5555h
+    mov cx, dx
+    shl cx, 1
+    or  dx, cx
+    or  [es:di + 2000h + 240], dx
     not ax
     and [es:di + 2000h + 240], ax
 .sv_row8_inv:
+    pop dx
+    pop cx
     pop di
     ret
 
@@ -3464,7 +3765,8 @@ hw_col:             dw 0
 hw_ncols:           dw 0
 hw_cell:            dw 0
 HW_SCROLL_MAX       equ 4      ; Larger column jumps fall back to a full redraw
-VSCROLL_MAX         equ 12     ; Larger row jumps fall back to a full redraw (0 = off)
+VSCROLL_MAX         equ 0      ; Vertical hardware scroll: max rows per step (0 = off; shows black
+                               ; bands on a Toshiba T1000 LCD, works in DOSBox / IBM CGA: try 12)
 invert_on:          db 0       ; Inverted colours active (colour c drawn as 3 - c)
 invert_request:     db 0       ; Toggle requested (I key / --invert), applied by INT 08h
 invert_word:        dw 0       ; 0FFFFh when inverted: XOR mask for colour-0 fills
